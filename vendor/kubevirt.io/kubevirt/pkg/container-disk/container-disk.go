@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * Copyright 2017 Red Hat, Inc.
+ * Copyright The KubeVirt Authors.
  *
  */
 
@@ -31,6 +31,7 @@ import (
 	kubev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
+	"kubevirt.io/kubevirt/pkg/os/disk"
 	"kubevirt.io/kubevirt/pkg/safepath"
 
 	ephemeraldisk "kubevirt.io/kubevirt/pkg/ephemeral-disk"
@@ -41,8 +42,6 @@ import (
 	"kubevirt.io/kubevirt/pkg/util"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 )
-
-var containerDiskOwner = "qemu"
 
 var podsBaseDir = util.KubeletPodsDir
 
@@ -135,25 +134,6 @@ func setPodsDirectory(dir string) error {
 	return os.MkdirAll(dir, 0750)
 }
 
-// The unit test suite uses this function
-func setLocalDataOwner(user string) {
-	containerDiskOwner = user
-}
-
-// GetDiskTargetPartFromLauncherView returns (path to disk image, image type, and error)
-func GetDiskTargetPartFromLauncherView(volumeIndex int) (string, error) {
-
-	path := GetDiskTargetPathFromLauncherView(volumeIndex)
-	exists, err := diskutils.FileExists(path)
-	if err != nil {
-		return "", err
-	} else if exists {
-		return path, nil
-	}
-
-	return "", fmt.Errorf("no supported file disk found for volume with index %d", volumeIndex)
-}
-
 // NewSocketPathGetter get the socket pat of a containerDisk. For testing a baseDir
 // can be provided which can for instance point to /tmp.
 func NewSocketPathGetter(baseDir string) SocketPathGetter {
@@ -195,7 +175,7 @@ func GetImage(root *safepath.Path, imagePath string) (*safepath.Path, error) {
 		}
 		return resolvedPath, nil
 	} else {
-		fallbackPath, err := root.AppendAndResolveWithRelativeRoot(DiskSourceFallbackPath)
+		fallbackPath, err := root.AppendAndResolveWithRelativeRoot(disk.DiskSourceFallbackPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to determine default image path %v: %v", fallbackPath, err)
 		}
@@ -208,12 +188,12 @@ func GetImage(root *safepath.Path, imagePath string) (*safepath.Path, error) {
 			return nil, fmt.Errorf("failed to check default image path %s: %v", fallbackPath, err)
 		}
 		if len(files) == 0 {
-			return nil, fmt.Errorf("no file found in folder %s, no disk present", DiskSourceFallbackPath)
+			return nil, fmt.Errorf("no file found in folder %s, no disk present", disk.DiskSourceFallbackPath)
 		} else if len(files) > 1 {
-			return nil, fmt.Errorf("more than one file found in folder %s, only one disk is allowed", DiskSourceFallbackPath)
+			return nil, fmt.Errorf("more than one file found in folder %s, only one disk is allowed", disk.DiskSourceFallbackPath)
 		}
 		fileName := files[0].Name()
-		resolvedPath, err := root.AppendAndResolveWithRelativeRoot(DiskSourceFallbackPath, fileName)
+		resolvedPath, err := root.AppendAndResolveWithRelativeRoot(disk.DiskSourceFallbackPath, fileName)
 		if err != nil {
 			return nil, fmt.Errorf("failed to check default image path %s: %v", imagePath, err)
 		}
@@ -371,10 +351,10 @@ func generateContainerFromVolume(vmi *v1.VirtualMachineInstance, config *virtcon
 func CreateEphemeralImages(
 	vmi *v1.VirtualMachineInstance,
 	diskCreator ephemeraldisk.EphemeralDiskCreatorInterface,
-	disksInfo map[string]*DiskInfo,
+	disksInfo map[string]*disk.DiskInfo,
 ) error {
 	// The domain is setup to use the COW image instead of the base image. What we have
-	// to do here is only create the image where the domain expects it (GetDiskTargetPartFromLauncherView)
+	// to do here is only create the image where the domain expects it (GetDiskTargetPathFromLauncherView)
 	// for each disk that requires it.
 
 	for i, volume := range vmi.Spec.Volumes {
@@ -383,9 +363,14 @@ func CreateEphemeralImages(
 			if info == nil {
 				return fmt.Errorf("no disk info provided for volume %s", volume.Name)
 			}
-			if backingFile, err := GetDiskTargetPartFromLauncherView(i); err != nil {
+			backingFile := GetDiskTargetPathFromLauncherView(i)
+			exists, err := diskutils.FileExists(backingFile)
+			if err != nil {
 				return err
-			} else if err := diskCreator.CreateBackedImageForVolume(volume, backingFile, info.Format); err != nil {
+			} else if !exists {
+				return fmt.Errorf("no supported file disk found for volume found in: %s", backingFile)
+			}
+			if err := diskCreator.CreateBackedImageForVolume(volume, backingFile, info.Format); err != nil {
 				return err
 			}
 		}
@@ -399,8 +384,7 @@ func getContainerDiskSocketBasePath(baseDir, podUID string) string {
 }
 
 // ExtractImageIDsFromSourcePod takes the VMI and its source pod to determine the exact image used by containerdisks and boot container images,
-// which is recorded in the status section of a started pod.
-// It returns a map where the key is the vlume name and the value is the imageID
+// which is recorded in the status section of a started pod
 func ExtractImageIDsFromSourcePod(vmi *v1.VirtualMachineInstance, sourcePod *kubev1.Pod) (imageIDs map[string]string, err error) {
 	imageIDs = map[string]string{}
 	for _, volume := range vmi.Spec.Volumes {
