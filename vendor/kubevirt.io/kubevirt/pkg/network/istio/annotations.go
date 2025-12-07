@@ -13,12 +13,19 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * Copyright 2021 Red Hat, Inc.
+ * Copyright The KubeVirt Authors.
  *
  */
 
 package istio
 
 const (
-	ISTIO_INJECT_ANNOTATION = "sidecar.istio.io/inject"
+	// InjectSidecarAnnotation Specifies whether an Envoy sidecar should be automatically injected into the workload
+	// https://istio.io/latest/docs/reference/config/annotations/#SidecarInject
+	InjectSidecarAnnotation = "sidecar.istio.io/inject"
+
+	// KubeVirtTrafficAnnotation Specifies a comma separated list of virtual interfaces
+	// whose inbound traffic (from VM) will be treated as outbound
+	// https://istio.io/latest/docs/reference/config/annotations/#SidecarTrafficKubevirtInterfaces
+	KubeVirtTrafficAnnotation = "traffic.sidecar.istio.io/kubevirtInterfaces"
 )

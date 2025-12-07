@@ -1,5 +1,5 @@
 /*
-Copyright 2022 Rancher Labs, Inc.
+Copyright 2025 Rancher Labs, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,237 +20,189 @@ package v3
 
 import (
 	"context"
+	"sync"
 	"time"
 
-	"github.com/rancher/lasso/pkg/client"
-	"github.com/rancher/lasso/pkg/controller"
 	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
-	"github.com/rancher/wrangler/pkg/generic"
+	"github.com/rancher/wrangler/v3/pkg/apply"
+	"github.com/rancher/wrangler/v3/pkg/condition"
+	"github.com/rancher/wrangler/v3/pkg/generic"
+	"github.com/rancher/wrangler/v3/pkg/kv"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/watch"
-	"k8s.io/client-go/tools/cache"
 )
 
-type GlobalRoleBindingHandler func(string, *v3.GlobalRoleBinding) (*v3.GlobalRoleBinding, error)
-
+// GlobalRoleBindingController interface for managing GlobalRoleBinding resources.
 type GlobalRoleBindingController interface {
-	generic.ControllerMeta
-	GlobalRoleBindingClient
-
-	OnChange(ctx context.Context, name string, sync GlobalRoleBindingHandler)
-	OnRemove(ctx context.Context, name string, sync GlobalRoleBindingHandler)
-	Enqueue(name string)
-	EnqueueAfter(name string, duration time.Duration)
-
-	Cache() GlobalRoleBindingCache
+	generic.NonNamespacedControllerInterface[*v3.GlobalRoleBinding, *v3.GlobalRoleBindingList]
 }
 
+// GlobalRoleBindingClient interface for managing GlobalRoleBinding resources in Kubernetes.
 type GlobalRoleBindingClient interface {
-	Create(*v3.GlobalRoleBinding) (*v3.GlobalRoleBinding, error)
-	Update(*v3.GlobalRoleBinding) (*v3.GlobalRoleBinding, error)
-
-	Delete(name string, options *metav1.DeleteOptions) error
-	Get(name string, options metav1.GetOptions) (*v3.GlobalRoleBinding, error)
-	List(opts metav1.ListOptions) (*v3.GlobalRoleBindingList, error)
-	Watch(opts metav1.ListOptions) (watch.Interface, error)
-	Patch(name string, pt types.PatchType, data []byte, subresources ...string) (result *v3.GlobalRoleBinding, err error)
+	generic.NonNamespacedClientInterface[*v3.GlobalRoleBinding, *v3.GlobalRoleBindingList]
 }
 
+// GlobalRoleBindingCache interface for retrieving GlobalRoleBinding resources in memory.
 type GlobalRoleBindingCache interface {
-	Get(name string) (*v3.GlobalRoleBinding, error)
-	List(selector labels.Selector) ([]*v3.GlobalRoleBinding, error)
-
-	AddIndexer(indexName string, indexer GlobalRoleBindingIndexer)
-	GetByIndex(indexName, key string) ([]*v3.GlobalRoleBinding, error)
+	generic.NonNamespacedCacheInterface[*v3.GlobalRoleBinding]
 }
 
-type GlobalRoleBindingIndexer func(obj *v3.GlobalRoleBinding) ([]string, error)
+// GlobalRoleBindingStatusHandler is executed for every added or modified GlobalRoleBinding. Should return the new status to be updated
+type GlobalRoleBindingStatusHandler func(obj *v3.GlobalRoleBinding, status v3.GlobalRoleBindingStatus) (v3.GlobalRoleBindingStatus, error)
 
-type globalRoleBindingController struct {
-	controller    controller.SharedController
-	client        *client.Client
-	gvk           schema.GroupVersionKind
-	groupResource schema.GroupResource
-}
+// GlobalRoleBindingGeneratingHandler is the top-level handler that is executed for every GlobalRoleBinding event. It extends GlobalRoleBindingStatusHandler by a returning a slice of child objects to be passed to apply.Apply
+type GlobalRoleBindingGeneratingHandler func(obj *v3.GlobalRoleBinding, status v3.GlobalRoleBindingStatus) ([]runtime.Object, v3.GlobalRoleBindingStatus, error)
 
-func NewGlobalRoleBindingController(gvk schema.GroupVersionKind, resource string, namespaced bool, controller controller.SharedControllerFactory) GlobalRoleBindingController {
-	c := controller.ForResourceKind(gvk.GroupVersion().WithResource(resource), gvk.Kind, namespaced)
-	return &globalRoleBindingController{
-		controller: c,
-		client:     c.Client(),
-		gvk:        gvk,
-		groupResource: schema.GroupResource{
-			Group:    gvk.Group,
-			Resource: resource,
-		},
+// RegisterGlobalRoleBindingStatusHandler configures a GlobalRoleBindingController to execute a GlobalRoleBindingStatusHandler for every events observed.
+// If a non-empty condition is provided, it will be updated in the status conditions for every handler execution
+func RegisterGlobalRoleBindingStatusHandler(ctx context.Context, controller GlobalRoleBindingController, condition condition.Cond, name string, handler GlobalRoleBindingStatusHandler) {
+	statusHandler := &globalRoleBindingStatusHandler{
+		client:    controller,
+		condition: condition,
+		handler:   handler,
 	}
+	controller.AddGenericHandler(ctx, name, generic.FromObjectHandlerToHandler(statusHandler.sync))
 }
 
-func FromGlobalRoleBindingHandlerToHandler(sync GlobalRoleBindingHandler) generic.Handler {
-	return func(key string, obj runtime.Object) (ret runtime.Object, err error) {
-		var v *v3.GlobalRoleBinding
-		if obj == nil {
-			v, err = sync(key, nil)
-		} else {
-			v, err = sync(key, obj.(*v3.GlobalRoleBinding))
-		}
-		if v == nil {
-			return nil, err
-		}
-		return v, err
+// RegisterGlobalRoleBindingGeneratingHandler configures a GlobalRoleBindingController to execute a GlobalRoleBindingGeneratingHandler for every events observed, passing the returned objects to the provided apply.Apply.
+// If a non-empty condition is provided, it will be updated in the status conditions for every handler execution
+func RegisterGlobalRoleBindingGeneratingHandler(ctx context.Context, controller GlobalRoleBindingController, apply apply.Apply,
+	condition condition.Cond, name string, handler GlobalRoleBindingGeneratingHandler, opts *generic.GeneratingHandlerOptions) {
+	statusHandler := &globalRoleBindingGeneratingHandler{
+		GlobalRoleBindingGeneratingHandler: handler,
+		apply:                              apply,
+		name:                               name,
+		gvk:                                controller.GroupVersionKind(),
 	}
-}
-
-func (c *globalRoleBindingController) Updater() generic.Updater {
-	return func(obj runtime.Object) (runtime.Object, error) {
-		newObj, err := c.Update(obj.(*v3.GlobalRoleBinding))
-		if newObj == nil {
-			return nil, err
-		}
-		return newObj, err
+	if opts != nil {
+		statusHandler.opts = *opts
 	}
+	controller.OnChange(ctx, name, statusHandler.Remove)
+	RegisterGlobalRoleBindingStatusHandler(ctx, controller, condition, name, statusHandler.Handle)
 }
 
-func UpdateGlobalRoleBindingDeepCopyOnChange(client GlobalRoleBindingClient, obj *v3.GlobalRoleBinding, handler func(obj *v3.GlobalRoleBinding) (*v3.GlobalRoleBinding, error)) (*v3.GlobalRoleBinding, error) {
+type globalRoleBindingStatusHandler struct {
+	client    GlobalRoleBindingClient
+	condition condition.Cond
+	handler   GlobalRoleBindingStatusHandler
+}
+
+// sync is executed on every resource addition or modification. Executes the configured handlers and sends the updated status to the Kubernetes API
+func (a *globalRoleBindingStatusHandler) sync(key string, obj *v3.GlobalRoleBinding) (*v3.GlobalRoleBinding, error) {
 	if obj == nil {
 		return obj, nil
 	}
 
-	copyObj := obj.DeepCopy()
-	newObj, err := handler(copyObj)
-	if newObj != nil {
-		copyObj = newObj
-	}
-	if obj.ResourceVersion == copyObj.ResourceVersion && !equality.Semantic.DeepEqual(obj, copyObj) {
-		return client.Update(copyObj)
-	}
-
-	return copyObj, err
-}
-
-func (c *globalRoleBindingController) AddGenericHandler(ctx context.Context, name string, handler generic.Handler) {
-	c.controller.RegisterHandler(ctx, name, controller.SharedControllerHandlerFunc(handler))
-}
-
-func (c *globalRoleBindingController) AddGenericRemoveHandler(ctx context.Context, name string, handler generic.Handler) {
-	c.AddGenericHandler(ctx, name, generic.NewRemoveHandler(name, c.Updater(), handler))
-}
-
-func (c *globalRoleBindingController) OnChange(ctx context.Context, name string, sync GlobalRoleBindingHandler) {
-	c.AddGenericHandler(ctx, name, FromGlobalRoleBindingHandlerToHandler(sync))
-}
-
-func (c *globalRoleBindingController) OnRemove(ctx context.Context, name string, sync GlobalRoleBindingHandler) {
-	c.AddGenericHandler(ctx, name, generic.NewRemoveHandler(name, c.Updater(), FromGlobalRoleBindingHandlerToHandler(sync)))
-}
-
-func (c *globalRoleBindingController) Enqueue(name string) {
-	c.controller.Enqueue("", name)
-}
-
-func (c *globalRoleBindingController) EnqueueAfter(name string, duration time.Duration) {
-	c.controller.EnqueueAfter("", name, duration)
-}
-
-func (c *globalRoleBindingController) Informer() cache.SharedIndexInformer {
-	return c.controller.Informer()
-}
-
-func (c *globalRoleBindingController) GroupVersionKind() schema.GroupVersionKind {
-	return c.gvk
-}
-
-func (c *globalRoleBindingController) Cache() GlobalRoleBindingCache {
-	return &globalRoleBindingCache{
-		indexer:  c.Informer().GetIndexer(),
-		resource: c.groupResource,
-	}
-}
-
-func (c *globalRoleBindingController) Create(obj *v3.GlobalRoleBinding) (*v3.GlobalRoleBinding, error) {
-	result := &v3.GlobalRoleBinding{}
-	return result, c.client.Create(context.TODO(), "", obj, result, metav1.CreateOptions{})
-}
-
-func (c *globalRoleBindingController) Update(obj *v3.GlobalRoleBinding) (*v3.GlobalRoleBinding, error) {
-	result := &v3.GlobalRoleBinding{}
-	return result, c.client.Update(context.TODO(), "", obj, result, metav1.UpdateOptions{})
-}
-
-func (c *globalRoleBindingController) Delete(name string, options *metav1.DeleteOptions) error {
-	if options == nil {
-		options = &metav1.DeleteOptions{}
-	}
-	return c.client.Delete(context.TODO(), "", name, *options)
-}
-
-func (c *globalRoleBindingController) Get(name string, options metav1.GetOptions) (*v3.GlobalRoleBinding, error) {
-	result := &v3.GlobalRoleBinding{}
-	return result, c.client.Get(context.TODO(), "", name, result, options)
-}
-
-func (c *globalRoleBindingController) List(opts metav1.ListOptions) (*v3.GlobalRoleBindingList, error) {
-	result := &v3.GlobalRoleBindingList{}
-	return result, c.client.List(context.TODO(), "", result, opts)
-}
-
-func (c *globalRoleBindingController) Watch(opts metav1.ListOptions) (watch.Interface, error) {
-	return c.client.Watch(context.TODO(), "", opts)
-}
-
-func (c *globalRoleBindingController) Patch(name string, pt types.PatchType, data []byte, subresources ...string) (*v3.GlobalRoleBinding, error) {
-	result := &v3.GlobalRoleBinding{}
-	return result, c.client.Patch(context.TODO(), "", name, pt, data, result, metav1.PatchOptions{}, subresources...)
-}
-
-type globalRoleBindingCache struct {
-	indexer  cache.Indexer
-	resource schema.GroupResource
-}
-
-func (c *globalRoleBindingCache) Get(name string) (*v3.GlobalRoleBinding, error) {
-	obj, exists, err := c.indexer.GetByKey(name)
+	origStatus := obj.Status.DeepCopy()
+	obj = obj.DeepCopy()
+	newStatus, err := a.handler(obj, obj.Status)
 	if err != nil {
-		return nil, err
+		// Revert to old status on error
+		newStatus = *origStatus.DeepCopy()
 	}
-	if !exists {
-		return nil, errors.NewNotFound(c.resource, name)
+
+	if a.condition != "" {
+		if errors.IsConflict(err) {
+			a.condition.SetError(&newStatus, "", nil)
+		} else {
+			a.condition.SetError(&newStatus, "", err)
+		}
 	}
-	return obj.(*v3.GlobalRoleBinding), nil
+	if !equality.Semantic.DeepEqual(origStatus, &newStatus) {
+		if a.condition != "" {
+			// Since status has changed, update the lastUpdatedTime
+			a.condition.LastUpdated(&newStatus, time.Now().UTC().Format(time.RFC3339))
+		}
+
+		var newErr error
+		obj.Status = newStatus
+		newObj, newErr := a.client.UpdateStatus(obj)
+		if err == nil {
+			err = newErr
+		}
+		if newErr == nil {
+			obj = newObj
+		}
+	}
+	return obj, err
 }
 
-func (c *globalRoleBindingCache) List(selector labels.Selector) (ret []*v3.GlobalRoleBinding, err error) {
-
-	err = cache.ListAll(c.indexer, selector, func(m interface{}) {
-		ret = append(ret, m.(*v3.GlobalRoleBinding))
-	})
-
-	return ret, err
+type globalRoleBindingGeneratingHandler struct {
+	GlobalRoleBindingGeneratingHandler
+	apply apply.Apply
+	opts  generic.GeneratingHandlerOptions
+	gvk   schema.GroupVersionKind
+	name  string
+	seen  sync.Map
 }
 
-func (c *globalRoleBindingCache) AddIndexer(indexName string, indexer GlobalRoleBindingIndexer) {
-	utilruntime.Must(c.indexer.AddIndexers(map[string]cache.IndexFunc{
-		indexName: func(obj interface{}) (strings []string, e error) {
-			return indexer(obj.(*v3.GlobalRoleBinding))
-		},
-	}))
+// Remove handles the observed deletion of a resource, cascade deleting every associated resource previously applied
+func (a *globalRoleBindingGeneratingHandler) Remove(key string, obj *v3.GlobalRoleBinding) (*v3.GlobalRoleBinding, error) {
+	if obj != nil {
+		return obj, nil
+	}
+
+	obj = &v3.GlobalRoleBinding{}
+	obj.Namespace, obj.Name = kv.RSplit(key, "/")
+	obj.SetGroupVersionKind(a.gvk)
+
+	if a.opts.UniqueApplyForResourceVersion {
+		a.seen.Delete(key)
+	}
+
+	return nil, generic.ConfigureApplyForObject(a.apply, obj, &a.opts).
+		WithOwner(obj).
+		WithSetID(a.name).
+		ApplyObjects()
 }
 
-func (c *globalRoleBindingCache) GetByIndex(indexName, key string) (result []*v3.GlobalRoleBinding, err error) {
-	objs, err := c.indexer.ByIndex(indexName, key)
+// Handle executes the configured GlobalRoleBindingGeneratingHandler and pass the resulting objects to apply.Apply, finally returning the new status of the resource
+func (a *globalRoleBindingGeneratingHandler) Handle(obj *v3.GlobalRoleBinding, status v3.GlobalRoleBindingStatus) (v3.GlobalRoleBindingStatus, error) {
+	if !obj.DeletionTimestamp.IsZero() {
+		return status, nil
+	}
+
+	objs, newStatus, err := a.GlobalRoleBindingGeneratingHandler(obj, status)
 	if err != nil {
-		return nil, err
+		return newStatus, err
 	}
-	result = make([]*v3.GlobalRoleBinding, 0, len(objs))
-	for _, obj := range objs {
-		result = append(result, obj.(*v3.GlobalRoleBinding))
+	if !a.isNewResourceVersion(obj) {
+		return newStatus, nil
 	}
-	return result, nil
+
+	err = generic.ConfigureApplyForObject(a.apply, obj, &a.opts).
+		WithOwner(obj).
+		WithSetID(a.name).
+		ApplyObjects(objs...)
+	if err != nil {
+		return newStatus, err
+	}
+	a.storeResourceVersion(obj)
+	return newStatus, nil
+}
+
+// isNewResourceVersion detects if a specific resource version was already successfully processed.
+// Only used if UniqueApplyForResourceVersion is set in generic.GeneratingHandlerOptions
+func (a *globalRoleBindingGeneratingHandler) isNewResourceVersion(obj *v3.GlobalRoleBinding) bool {
+	if !a.opts.UniqueApplyForResourceVersion {
+		return true
+	}
+
+	// Apply once per resource version
+	key := obj.Namespace + "/" + obj.Name
+	previous, ok := a.seen.Load(key)
+	return !ok || previous != obj.ResourceVersion
+}
+
+// storeResourceVersion keeps track of the latest resource version of an object for which Apply was executed
+// Only used if UniqueApplyForResourceVersion is set in generic.GeneratingHandlerOptions
+func (a *globalRoleBindingGeneratingHandler) storeResourceVersion(obj *v3.GlobalRoleBinding) {
+	if !a.opts.UniqueApplyForResourceVersion {
+		return
+	}
+
+	key := obj.Namespace + "/" + obj.Name
+	a.seen.Store(key, obj.ResourceVersion)
 }

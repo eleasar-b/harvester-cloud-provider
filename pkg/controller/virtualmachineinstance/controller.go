@@ -7,7 +7,7 @@ import (
 	"github.com/harvester/harvester/pkg/builder"
 	"github.com/harvester/harvester/pkg/controller/master/virtualmachine"
 	ctlv1 "github.com/harvester/harvester/pkg/generated/controllers/kubevirt.io/v1"
-	ctlcorev1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	ctlcorev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -65,9 +65,12 @@ type Handler struct {
 func (h *Handler) OnVmiChanged(_ string, vmi *kubevirtv1.VirtualMachineInstance) (*kubevirtv1.VirtualMachineInstance, error) {
 	// TODO: Add some unit tests for this controller
 
+	if vmi == nil || vmi.DeletionTimestamp != nil {
+		return vmi, nil
+	}
+
 	// only handle the migration completed vmi
-	if vmi == nil || vmi.DeletionTimestamp != nil ||
-		vmi.Annotations == nil || vmi.Namespace != h.namespace || !isMigrationCompleted(vmi) {
+	if vmi.Annotations == nil || vmi.Labels == nil || vmi.Namespace != h.namespace || !isMigrationCompleted(vmi) {
 		logrus.WithFields(logrus.Fields{
 			"namespace": vmi.Namespace,
 			"name":      vmi.Name,
