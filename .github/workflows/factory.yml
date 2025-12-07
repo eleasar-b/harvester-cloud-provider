@@ -10,7 +10,7 @@ on:
 
 env:
   registry: "ghcr.io"
-  repo: "eleasar.b"
+  repo: "eleasar.b/harvester-cloud-provider"
   controllerImageName: "harvester-cloud-provider"
 
 jobs:
