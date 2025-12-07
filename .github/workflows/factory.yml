@@ -10,8 +10,8 @@ on:
 
 env:
   registry: "ghcr.io"
-  repo: "eleasar.b/harvester-cloud-provider"
-  controllerImageName: "harvester-cloud-provider"
+  repo: "eleasar.b"
+  image_name: "harvester-cloud-provider"
 
 jobs:
   dapper-build:
@@ -40,13 +40,21 @@ jobs:
         registry: ${{ env.registry }}
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.registry }}/${{ env.image_name }}
+        labels: |
+          org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
-    - name: Docker build (Controller)
+    - name: Docker build
       uses: docker/build-push-action@v5
       with:
         provenance: false
         context: .
         platforms: linux/amd64,linux/arm64
         file: package/Dockerfile
-        push: ${{ inputs.push }}
-        tags: ${{ env.registry }}/${{ env.repo }}/${{ env.controllerImageName }}:${{ inputs.tag }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
