@@ -10,8 +10,6 @@ on:
 
 env:
   registry: "ghcr.io"
-  repo: "eleasar.b"
-  image_name: "harvester-cloud-provider"
 
 jobs:
   dapper-build:
@@ -45,7 +43,7 @@ jobs:
       id: meta
       uses: docker/metadata-action@v5
       with:
-        images: ${{ env.registry }}/${{ env.image_name }}
+        images: ${{ env.registry }}/${{ github.repository }}
         labels: |
           org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
