@@ -50,7 +50,7 @@ jobs:
           org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
     - name: Docker build
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v6
       with:
         provenance: false
         context: .
@@ -58,3 +58,4 @@ jobs:
         file: package/Dockerfile
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
+        push: ${{ inputs.push }}
