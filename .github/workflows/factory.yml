@@ -1,4 +1,12 @@
 on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        required: true
+        type: string
+      push:
+        required: true
+        type: boolean
   workflow_call:
     inputs:
       tag:
